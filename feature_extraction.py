@@ -3,10 +3,13 @@ from crypt import methods
 import numpy as np
 import pandas as pd
 import collections
+from datetime import datetime
 
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
+from sklearn.svm import SVC
+from sklearn.model_selection import GridSearchCV
 from sklearn.model_selection import RandomizedSearchCV
 from collections import Counter
 from sklearn.metrics import confusion_matrix
@@ -29,31 +32,34 @@ from sklearn.metrics import matthews_corrcoef
 from sklearn.metrics import f1_score
 from imblearn.over_sampling import SMOTE
 from imblearn.under_sampling import OneSidedSelection
+import matplotlib.pyplot as plt
 
 class Extraction:
     def __init__(self):
         self.config = {
-            'file': 'esc-01-Mixed-traffic_test.csv',
+            'file': 'esc-01-Mixed-traffic.csv',
             'initial_test': True, # first run before transform
             'methods': ['pca', 'tsne', 'lle', 'umap'], # ['pca', 'tsne', 'lle', 'umap']
-            'n_components': range(15,26,4),
+            'n_components': range(1,26,3),
             'smote': False, # Oversampling before transform
             'oss': True, # Undersampling before transform
-            'pca_solvers': ['randomized'], # ['arpack', 'full','randomized']
+            'pca_solvers': ['arpack', 'full','randomized'], # ['arpack', 'full','randomized']
             'tsne':  {
-                'methods': ['exact'],
-                'perplexity': range(5,51,15)
+                'methods': ['exact','barnes_hut'], #['exact','barnes_hut']
+                'perplexity': range(5, 46, 10)
             },
             'lle': {
-                'method': ['modified'],
+                'method': ['standard','modified'], # ['standard','modified']
                 'neighbors': range(3,30,3) 
             },
             'umap': {
-                'neighbors': range(3,13,3)
-            }
-            # 'svd_solvers': ['randomized'],
+                'neighbors': range(3,19,3)
+            },
+            'algorithms': ['SVM'] # ['XGBC', 'SVM']
+            # for use SVM you should set to Tue 'oss' config
         }
         self.df = pd.DataFrame()
+        self.filename = 'results-' + datetime.now().strftime("%m-%d-%YT%H:%M") + '.csv'
        
 
     def preprocessing(self):
@@ -67,7 +73,7 @@ class Extraction:
         self.y_test = None
         self.y_train = None
         self.results = pd.DataFrame()
-        self.fields = ['method', 'n', 'config', 'time', 'time_extraction', 'fn', 'fp', 'tp', 'tn', 'mf1', 'mcc', 'info_variance']
+        self.fields = ['algorithm','method', 'n', 'config', 'time (seconds)', 'time_extraction (seconds)', 'fn', 'fp', 'tp', 'tn', 'mf1', 'mcc', 'info_variance']
 
         print('Dataset dimensions, number of sessions and features: ', self.df.shape)
         print("counting classes: ", collections.Counter(self.df.label.values))
@@ -136,20 +142,28 @@ class Extraction:
 
     def evaluateModel(self, X_train_transformed, test_data, time_extraction, option, method, n, info_variance):
         print('Create and evaluate model...')
-        modelXGBC, time = self.XGBC(X_train_transformed)
-        y_pred = modelXGBC.predict(test_data)
-        CM = confusion_matrix(self.y_test, y_pred)
-        TN = CM[0][0]
-        FN = CM[1][0]
-        TP = CM[1][1]
-        FP = CM[0][1]
+        for algorithm in self.config['algorithms']:
+            if(algorithm == 'XGBC'):
+                model, time = self.XGBC(X_train_transformed)
+            if(algorithm == 'SVM'):
+                model, time = self.SVM(X_train_transformed)
+            y_pred = model.predict(test_data)
+            CM = confusion_matrix(self.y_test, y_pred)
+            TN = CM[0][0]
+            FN = CM[1][0]
+            TP = CM[1][1]
+            FP = CM[0][1]
 
-        
-        mf1 = f1_score(self.y_test, y_pred, average='macro')
-        mcc = matthews_corrcoef(self.y_test, y_pred)
-        row = pd.Series(data=[method, n, option, time, time_extraction, FN, FP, TP, TN, mf1, mcc, info_variance], index = self.fields)
-        self.results = self.results.append(row, ignore_index = True)
-        self.results.to_csv('results.csv')
+            mf1 = round(f1_score(self.y_test, y_pred, average='macro'), 4)
+            mcc = round(matthews_corrcoef(self.y_test, y_pred), 4)
+            time = round(time, 2)
+            time_extraction = round(time_extraction, 2)
+            info_variance = round(info_variance, 4)
+            
+            
+            row = pd.Series(data=[algorithm, method, n, option, time, time_extraction, FN, FP, TP, TN, mf1, mcc, info_variance], index = self.fields)
+            self.results = self.results.append(row, ignore_index = True)
+            self.results.to_csv(self.filename)
         print('Done')
 
     def processData(self):
@@ -165,11 +179,18 @@ class Extraction:
                         [X_train_transformed, X_test_transformed, time_extraction, info_variance] = self.PCA(n, config, self.X_train, self.X_test)
                         self.evaluateModel(X_train_transformed, X_test_transformed, time_extraction, config, method, n, info_variance)
                 if method == 'tsne':
-                    for config in self.config['tsne']['perplexity']:
-                        print('Perplexity: ', config)
-                        [X_train_transformed, X_test_transformed, time_extraction, info_variance] = self.tsne(n, config, self.X_train, self.X_test)
-                        config = 'perplexity=' + str(config)
-                        self.evaluateModel(X_train_transformed, X_test_transformed, time_extraction, config, method, n, info_variance)
+                    for p in self.config['tsne']['perplexity']:
+                        for m in self.config['tsne']['methods']:
+                            go = True
+                            if(m == 'barnes_hut' and n > 4):
+                                go = False
+                            if(go):
+                                print('Perplexity: ', p)
+                                print('Tsne-Method: ', m)
+                                config_tsne = [p, m]
+                                [X_train_transformed, X_test_transformed, time_extraction, info_variance] = self.tsne(n, config_tsne, self.X_train, self.X_test)
+                                config = 'perplexity=' + str(config_tsne[0]) + ' method=' + str(config_tsne[1])
+                                self.evaluateModel(X_train_transformed, X_test_transformed, time_extraction, config, method, n, info_variance)
                 if method == 'lle':
                     for neighbors in self.config['lle']['neighbors']:
                         for config in self.config['lle']['method']:
@@ -203,11 +224,11 @@ class Extraction:
             
     def LLE(self, n, config, X_train, X_test):
         start=perf_counter()
-        embedding = LocallyLinearEmbedding(n_components=n, n_neighbors=config[0], method=config[1], n_jobs = -1)
+        embedding = LocallyLinearEmbedding(n_components=n, n_neighbors=config[0], method=config[1], n_jobs = -1, eigen_solver='dense')
         X_train_tranformed = embedding.fit_transform(X_train)
         X_test_tranformed = embedding.transform(X_test)
         tl=(perf_counter()-start)
-        return X_train_tranformed, X_test_tranformed, tl, 'unknown'
+        return X_train_tranformed, X_test_tranformed, tl, 0
 
             
     def PCA(self, n, solver, X_train, X_test):
@@ -218,14 +239,13 @@ class Extraction:
 
         index = np.arange(n)
 
-        plt.figure()
-        ax = plt.subplot()
-        cumulative = np.cumsum(pca.explained_variance_ratio_)
-        ax.bar(index, pca.explained_variance_ratio_)
-        ax.bar(index, cumulative)
+        # plt.figure()
+        # ax = plt.subplot()
+        # cumulative = np.cumsum(pca.explained_variance_ratio_)
+        # ax.bar(index, pca.explained_variance_ratio_)
+        # ax.bar(index, cumulative)
+        # plt.plot(np.cumsum(pca.explained_variance_ratio_))
 
-
-        plt.plot(np.cumsum(pca.explained_variance_ratio_))
         X_train_tranformed = pca.transform(X_train)
         X_test_tranformed = pca.transform(X_test)
         tl=(perf_counter()-start)
@@ -233,7 +253,7 @@ class Extraction:
 
     def tsne(self, n, config, X_train, X_test):
         start=perf_counter()
-        tsne = TSNE(n_components = n, verbose = 1, perplexity = config, method='exact', n_jobs = -1)
+        tsne = TSNE(n_components = n, verbose = False, perplexity = config[0], method=config[1], n_jobs = -1)
         print(type(self.X_train))
         X_train_tranformed = tsne.fit_transform(self.X_train)
         X_test_tranformed = tsne.fit_transform(self.X_test)
@@ -276,17 +296,48 @@ class Extraction:
         tl=(perf_counter()-start)
         return model, tl
 
-    def writeResults(self):
-        self.results.to_csv('results.csv')
+    def SVM(self, X_train):
+        #Run grid search only on training set using cross-validation, n_jobs to -1, it will use all cores
 
+        start=perf_counter()
+        parameters = {'C':np.arange(1, 20)}
+        model4 = GridSearchCV(SVC(class_weight='balanced', kernel='rbf'), parameters, cv=5,n_jobs=-1, verbose=False)
+        model4.fit(X_train, self.y_train.values)
+        tl=(perf_counter()-start)
+        return model4, tl
+
+    def chartResults(self):
+        markers = ['o','x','+','*']
+        colors = ['b','r','g','k']
+        toPlot = []
+        for algorithm in self.config['algorithms']:
+            filterAlgorithm = self.results.query('algorithm == "%s"' % (algorithm))
+            for metric in ['mf1','mcc']:
+                toPlot = []
+                for method in self.config['methods']:
+                    filterMethod = filterAlgorithm.query('method == "%s"' % (method))
+                    results = []
+                    for n in self.config['n_components']:
+                        temp = filterMethod.query('n == %s' % (n))
+                        results.append(temp.get([metric]).values[0].max())
+                    toPlot.append(results)
+                # print(toPlot)
+                
+                for i in range(len(self.config['methods'])):
+                    plt.plot(self.config['n_components'], toPlot[i], marker=markers[i], linestyle='--',color=colors[i],label=self.config['methods'][i])
+                plt.xlabel('n_components')
+                plt.ylabel(metric)
+                plt.title(algorithm)
+                plt.legend()
+                plt.show()
 
 e = Extraction()
 e.preprocessing()
-if(e.config['initial_test']):
-    e.beforeExtraction()
 if(e.config['smote']):
     e.overSampling(e.X_train, e.y_train)
 if(e.config['oss']):
     e.underSampling(e.X_train, e.y_train)
+if(e.config['initial_test']):
+    e.beforeExtraction()
 e.processData()
-e.writeResults()
+e.chartResults()
