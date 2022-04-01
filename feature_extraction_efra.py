@@ -1,0 +1,339 @@
+#import libraries
+from crypt import methods
+import numpy as np
+import pandas as pd
+import collections
+from datetime import datetime
+
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier
+from sklearn.svm import SVC
+from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import RandomizedSearchCV
+from collections import Counter
+from sklearn.metrics import confusion_matrix
+from sklearn.metrics import plot_confusion_matrix
+import warnings
+warnings.filterwarnings('ignore')
+from time import perf_counter
+from category_encoders import TargetEncoder
+from sklearn.preprocessing import StandardScaler
+from sklearn.compose import ColumnTransformer
+#the VarianceThreshold class from sklearn support a type of feature selection
+from sklearn.feature_selection import VarianceThreshold
+
+from sklearn.decomposition import PCA
+from sklearn.manifold import Isomap # for Isomap dimensionality reduction
+from sklearn.manifold import LocallyLinearEmbedding
+from sklearn.manifold import TSNE
+import umap
+from sklearn.metrics import matthews_corrcoef
+from sklearn.metrics import f1_score
+from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import OneSidedSelection
+import matplotlib.pyplot as plt
+
+class Extraction:
+    def __init__(self):
+        self.config = {
+            'file': 'efra_test.csv',
+            'initial_test': True, # first run before transform
+            'methods': ['pca'], # ['pca', 'tsne', 'lle', 'umap']
+            'n_components': range(1,11,2),
+            'smote': False, # Oversampling before transform
+            'oss': True, # Undersampling before transform
+            'pca_solvers': ['arpack', 'full','randomized'], # ['arpack', 'full','randomized']
+            'tsne':  {
+                'methods': ['exact','barnes_hut'], #['exact','barnes_hut']
+                'perplexity': range(5, 46, 10)
+            },
+            'lle': {
+                'method': ['standard','modified'], # ['standard','modified']
+                'neighbors': range(3,30,3) 
+            },
+            'umap': {
+                'neighbors': range(3,13,3)
+            },
+            'algorithms': ['SVM'] # ['XGBC', 'SVM']
+            # 'svd_solvers': ['randomized'], for use SVM you should set to Tue 'oss' config
+        }
+        self.df = pd.DataFrame()
+        self.filename = 'results-' + datetime.now().strftime("%m-%d-%YT%H:%M") + '.csv'
+       
+
+    def preprocessing(self):
+        self.df=pd.read_csv(self.config.get('file'))
+        print(self.df)
+         #No trunkated 
+        pd.set_option('display.max_columns', None)
+
+        self.target_names = ['class 0', 'class 1']
+        self.X_train = None
+        self.X_test = None
+        self.y_test = None
+        self.y_train = None
+        self.results = pd.DataFrame()
+        self.fields = ['algorithm','method', 'n', 'config', 'time (seconds)', 'time_extraction (seconds)', 'fn', 'fp', 'tp', 'tn', 'mf1', 'mcc', 'info_variance']
+        # change label values
+        self.df['Label'] = self.df.Label.str.contains("Botnet")
+        self.df['Label'] = self.df['Label'].astype(int)
+
+        # print('Dataset dimensions, number of sessions and features: ', self.df.shape)
+        # print("counting classes: ", collections.Counter(self.df.label.values))
+        # print("check the number of null values: ", self.df.isnull().values.sum())
+
+        #delete StartTime feature
+        self.df.drop(['StartTime','SrcAddr', 'DstAddr'],axis=1,inplace=True)
+
+        self.df['sTos'] = self.df['sTos'].astype(str)
+        self.df['dTos'] = self.df['dTos'].astype(str)
+
+        self.X_train,self.X_test,self.y_train,self.y_test = train_test_split(self.df.drop(columns=['Label']), self.df['Label'], test_size=0.3, random_state=42)
+
+        # Coding of categorical variables
+        # Selecting categorical variables to be coded
+        enc = TargetEncoder(cols=['Proto','Sport','Dir','Dport','State','sTos','dTos'])
+
+        # fit on the trainning dataset
+        enc.fit_transform(self.X_train, self.y_train)
+        # Coding categorical variables of the trainning dataset
+        training_numeric_dataset=enc.transform(self.X_train)
+        # Coding categorical variables of the test dataset
+        testing_numeric_dataset = enc.transform(self.X_test)
+        
+        numeric_cols = training_numeric_dataset.select_dtypes(include=['float64', 'int']).columns.to_list()
+        preprocessor = ColumnTransformer([('scale', StandardScaler(), numeric_cols)], remainder='passthrough')
+
+        preprocessor.fit_transform(training_numeric_dataset)
+        X_train_stand = preprocessor.transform(training_numeric_dataset)
+        X_test_stand  = preprocessor.transform(testing_numeric_dataset)
+        labels=list(training_numeric_dataset.columns.values.tolist())
+        self.X_train=pd.DataFrame(X_train_stand,columns=labels)
+        self.X_test=pd.DataFrame(X_test_stand,columns=labels)
+
+    def overSampling(self, X, y):
+        print('Oversampling with smote...')
+        smote = SMOTE()
+        # fit on the trainning dataset
+        self.X_train , self.y_train = smote.fit_resample(X, y)
+
+    def underSampling(self, X, y):
+        # define the undersampling method, n_jobs=-1 means using all processors
+        oss = OneSidedSelection(random_state=0, n_jobs=-1)
+        start=perf_counter()
+        # fit on the trainning dataset
+        self.X_train , self.y_train = oss.fit_resample(X, y)
+        tl=(perf_counter()-start)/3600
+        print ('Elapsed time: %.2f hrs.' %tl)
+        # summarize the new class distribution
+        print('Original dataset shape:', Counter(y))
+        print('Resample dataset shape:', Counter(self.y_train))
+
+    def beforeExtraction(self):
+        print('Running initial test...')
+        self.evaluateModel(self.X_train, self.X_test, 0, '', 'beforeExtraction', 0, 1)
+
+    def evaluateModel(self, X_train_transformed, test_data, time_extraction, option, method, n, info_variance):
+        print('Create and evaluate model...')
+        for algorithm in self.config['algorithms']:
+            if(algorithm == 'XGBC'):
+                model, time = self.XGBC(X_train_transformed)
+            if(algorithm == 'SVM'):
+                model, time = self.SVM(X_train_transformed)
+            y_pred = model.predict(test_data)
+            CM = confusion_matrix(self.y_test, y_pred)
+            TN = CM[0][0]
+            FN = CM[1][0]
+            TP = CM[1][1]
+            FP = CM[0][1]
+
+            mf1 = round(f1_score(self.y_test, y_pred, average='macro'), 4)
+            mcc = round(matthews_corrcoef(self.y_test, y_pred), 4)
+            time = round(time, 2)
+            time_extraction = round(time_extraction, 2)
+            info_variance = round(info_variance, 4)
+            
+            
+            row = pd.Series(data=[algorithm, method, n, option, time, time_extraction, FN, FP, TP, TN, mf1, mcc, info_variance], index = self.fields)
+            self.results = self.results.append(row, ignore_index = True)
+            self.results.to_csv(self.filename)
+        print('Done')
+
+    def processData(self):
+        print('List of extraction methods to test', self.config['methods'])
+        for method in self.config['methods']:
+            print("Extracting with method: ", method)
+
+            for n in self.config['n_components']:
+                print("n_components: ", n)
+                if method == 'pca':
+                    for config in self.config['pca_solvers']:
+                        print('Solver: ', config)
+                        [X_train_transformed, X_test_transformed, time_extraction, info_variance] = self.PCA(n, config, self.X_train, self.X_test)
+                        self.evaluateModel(X_train_transformed, X_test_transformed, time_extraction, config, method, n, info_variance)
+                if method == 'tsne':
+                    for p in self.config['tsne']['perplexity']:
+                        for m in self.config['tsne']['methods']:
+                            go = True
+                            if(m == 'barnes_hut' and n > 4):
+                                go = False
+                            if(go):
+                                print('Perplexity: ', p)
+                                print('Tsne-Method: ', m)
+                                config_tsne = [p, m]
+                                [X_train_transformed, X_test_transformed, time_extraction, info_variance] = self.tsne(n, config_tsne, self.X_train, self.X_test)
+                                config = 'perplexity=' + str(config_tsne[0]) + ' method=' + str(config_tsne[1])
+                                self.evaluateModel(X_train_transformed, X_test_transformed, time_extraction, config, method, n, info_variance)
+                if method == 'lle':
+                    for neighbors in self.config['lle']['neighbors']:
+                        for config in self.config['lle']['method']:
+                            go = True
+                            if( config == 'modified' and neighbors < n):
+                                go = False
+                            if(go):
+                                print('Neighbors: ', neighbors, ' method: ', config)
+                                config_lle = [neighbors, config]
+                                [X_train_transformed, X_test_transformed, time_extraction, info_variance] = self.LLE(n, config_lle, self.X_train, self.X_test)
+                                config_lle_str = 'n_neighbors=' + str(neighbors) + ', method=' + config
+                                self.evaluateModel(X_train_transformed, X_test_transformed, time_extraction, config_lle_str, method, n, info_variance)
+                if method == 'umap':
+                    for config in self.config['umap']['neighbors']:
+                        print('Neighbors', config)
+                        [X_train_transformed, X_test_transformed, time_extraction, info_variance] = self.umap(n, config, self.X_train, self.X_test)
+                        self.evaluateModel(X_train_transformed, X_test_transformed, time_extraction, config, method, n, info_variance)
+                
+                
+
+
+
+    def umap(self, n, config, X_train, X_test):
+        start=perf_counter()   
+        reducer = umap.UMAP(n_components=n, n_neighbors=config)
+        X_train_tranformed = reducer.fit_transform(X_train)
+        X_test_tranformed = reducer.transform(X_test)
+        tl=(perf_counter()-start)    
+        print(tl)
+        return X_train_tranformed, X_test_tranformed, tl, 0
+            
+    def LLE(self, n, config, X_train, X_test):
+        start=perf_counter()
+        embedding = LocallyLinearEmbedding(n_components=n, n_neighbors=config[0], method=config[1], n_jobs = -1, eigen_solver='dense')
+        X_train_tranformed = embedding.fit_transform(X_train)
+        X_test_tranformed = embedding.transform(X_test)
+        tl=(perf_counter()-start)
+        return X_train_tranformed, X_test_tranformed, tl, 0
+
+            
+    def PCA(self, n, solver, X_train, X_test):
+        start=perf_counter()
+        pca = PCA(n_components = n, svd_solver = solver)
+        pca.fit(X_train)
+        info_variance = (pca.explained_variance_ratio_*100).sum()
+
+        index = np.arange(n)
+
+        # plt.figure()
+        # ax = plt.subplot()
+        # cumulative = np.cumsum(pca.explained_variance_ratio_)
+        # ax.bar(index, pca.explained_variance_ratio_)
+        # ax.bar(index, cumulative)
+        # plt.plot(np.cumsum(pca.explained_variance_ratio_))
+
+        X_train_tranformed = pca.transform(X_train)
+        X_test_tranformed = pca.transform(X_test)
+        tl=(perf_counter()-start)
+        return X_train_tranformed, X_test_tranformed, tl, info_variance
+
+    def tsne(self, n, config, X_train, X_test):
+        start=perf_counter()
+        tsne = TSNE(n_components = n, verbose = False, perplexity = config[0], method=config[1], n_jobs = -1)
+        print(type(self.X_train))
+        X_train_tranformed = tsne.fit_transform(self.X_train)
+        X_test_tranformed = tsne.fit_transform(self.X_test)
+        tl=(perf_counter()-start)
+        return X_train_tranformed, X_test_tranformed, tl, 0
+
+    def isomap(self, n, config, X_train, X_test):
+        start=perf_counter()
+        print(start)
+        embed3 = Isomap(
+            n_neighbors=5, # default=5, algorithm finds local structures based on the nearest neighbors
+            n_components=n, # number of dimensions
+            eigen_solver='auto', # {‘auto’, ‘arpack’, ‘dense’}, default=’auto’
+            tol=0, # default=0, Convergence tolerance passed to arpack or lobpcg. not used if eigen_solver == ‘dense’.
+            max_iter=None, # default=None, Maximum number of iterations for the arpack solver. not used if eigen_solver == ‘dense’.
+            path_method='auto', # {‘auto’, ‘FW’, ‘D’}, default=’auto’, Method to use in finding shortest path.
+            neighbors_algorithm='auto', # neighbors_algorithm{‘auto’, ‘brute’, ‘kd_tree’, ‘ball_tree’}, default=’auto’
+            n_jobs=-1, # n_jobsint or None, default=None, The number of parallel jobs to run. -1 means using all processors
+            metric='minkowski', # string, or callable, default=”minkowski”
+            p=2, # default=2, Parameter for the Minkowski metric. When p = 1, this is equivalent to using manhattan_distance (l1), and euclidean_distance (l2) for p = 2
+            metric_params=None # default=None, Additional keyword arguments for the metric function.
+        )
+        isomap = embed3.fit(X_train)
+        X_test_tranformed = isomap.fit_transform(X_test)
+        X_train_tranformed = isomap.fit_transform(X_train)
+        tl=(perf_counter()-start)
+        return X_train_tranformed, X_test_tranformed, tl
+
+    def XGBC(self, X_train):
+        #Run grid search only on training set using cross-validation, n_jobs to -1, it will use all cores
+        start=perf_counter()
+        parameters = {'max_depth': np.arange (2, 10),'n_estimators': np.arange(60, 220, 40), 
+                    'learning_rate': [0.1, 0.01, 0.05],'gamma' : [0.1, 1, 1.5], 
+                    'subsample' : [0.8, 0.9, 1.0],
+                    'colsample_bytree' : [0.3, 0.5, 1.0]}
+        model = RandomizedSearchCV(XGBClassifier(eval_metric='logloss',use_label_encoder =False),
+                                    parameters, cv=5, n_jobs=-1,scoring='roc_auc',verbose=False)
+
+        model.fit(X_train, self.y_train.values)
+        tl=(perf_counter()-start)
+        return model, tl
+
+    def SVM(self, X_train):
+        #Run grid search only on training set using cross-validation, n_jobs to -1, it will use all cores
+
+        start=perf_counter()
+        parameters = {'C':np.arange(1, 20)}
+        model4 = GridSearchCV(SVC(class_weight='balanced', kernel='rbf'), parameters, cv=5,n_jobs=-1, verbose=False)
+        model4.fit(X_train, self.y_train.values)
+        tl=(perf_counter()-start)
+        return model4, tl
+
+    def chartResults(self):
+        markers = ['o','x','+','*']
+        colors = ['b','r','g','k']
+        toPlot = []
+        for algorithm in self.config['algorithms']:
+            filterAlgorithm = self.results.query('algorithm == "%s"' % (algorithm))
+            for metric in ['mf1','mcc']:
+                toPlot = []
+                for method in self.config['methods']:
+                    filterMethod = filterAlgorithm.query('method == "%s"' % (method))
+                    results = []
+                    for n in self.config['n_components']:
+                        temp = filterMethod.query('n == %s' % (n))
+                        results.append(temp.get([metric]).values[0].max())
+                    toPlot.append(results)
+                # print(toPlot)
+                
+                for i in range(len(self.config['methods'])):
+                    plt.plot(self.config['n_components'], toPlot[i], marker=markers[i], linestyle='--',color=colors[i],label=self.config['methods'][i])
+                plt.xlabel('n_components')
+                plt.ylabel(metric)
+                plt.title(algorithm)
+                plt.legend()
+                plt.show()
+
+e = Extraction()
+e.preprocessing()
+if(e.config['smote']):
+    e.overSampling(e.X_train, e.y_train)
+if(e.config['oss']):
+    e.underSampling(e.X_train, e.y_train)
+if(e.config['initial_test']):
+    e.beforeExtraction()
+e.processData()
+e.chartResults()
+
+
